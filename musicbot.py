@@ -29,7 +29,7 @@ def _download_audio_sync(url: str) -> str | None:
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "192"}
         ],
-        # Railway/Docker image ffmpeg path:
+        # ffmpeg paths inside Docker/Nixpacks
         "ffmpeg_location": "/usr/bin/ffmpeg",
         "ffprobe_location": "/usr/bin/ffprobe",
         "postprocessor_args": ["-hide_banner"],
@@ -41,7 +41,16 @@ def _download_audio_sync(url: str) -> str | None:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            return ydl.prepare_filename(info)
+
+            # <<< the important part: get the FINAL path >>>
+            # After post-processing, yt-dlp stores the real file path here:
+            reqs = info.get("requested_downloads") or []
+            if reqs and "filepath" in reqs[0]:
+                return reqs[0]["filepath"]
+
+            # Fallback (sometimes works if no post-processing changed the name)
+            candidate = info.get("filepath") or ydl.prepare_filename(info)
+            return candidate if candidate and os.path.exists(candidate) else None
     except Exception as e:
         print(f"[yt-dlp] error: {e}")
         return None
