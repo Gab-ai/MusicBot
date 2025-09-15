@@ -26,39 +26,55 @@ song_queue = asyncio.Queue()
 def _download_audio_sync(url: str) -> str | None:
     ydl_opts = {
         "format": "bestaudio/best",
+        "noplaylist": True,
+        # Always end up with an m4a file
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "192"}
         ],
-        # ffmpeg paths inside Docker/Nixpacks
-        "ffmpeg_location": "/usr/bin/ffmpeg",
-        "ffprobe_location": "/usr/bin/ffprobe",
-        "postprocessor_args": ["-hide_banner"],
+        "final_ext": "m4a",
+
+        # Make filenames safe & stable (id only)
+        "restrictfilenames": True,
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+
+        # Headless-friendly + retries
         "quiet": True,
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         "default_search": "ytsearch",
-        "nocheckcertificate": True,
+        "retry_sleep_functions": {"http": [1, 2, 4, 8] },
+        "retries": 5,
+
+        # ffmpeg (Docker/Nixpacks place it here)
+        "ffmpeg_location": "/usr/bin/ffmpeg",
+        "postprocessor_args": ["-hide_banner"],
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-            # <<< the important part: get the FINAL path >>>
-            # After post-processing, yt-dlp stores the real file path here:
+            # Preferred: post-processed path
             reqs = info.get("requested_downloads") or []
-            if reqs and "filepath" in reqs[0]:
+            if reqs and isinstance(reqs[0], dict) and "filepath" in reqs[0]:
                 return reqs[0]["filepath"]
 
-            # Fallback (sometimes works if no post-processing changed the name)
-            candidate = info.get("filepath") or ydl.prepare_filename(info)
+            # Fallbacks
+            fp = info.get("filepath")
+            if fp and os.path.exists(fp):
+                return fp
+
+            # Last resort: infer "<id>.m4a"
+            vid = info.get("id")
+            candidate = os.path.join(DOWNLOAD_DIR, f"{vid}.m4a") if vid else None
             return candidate if candidate and os.path.exists(candidate) else None
     except Exception as e:
         print(f"[yt-dlp] error: {e}")
         return None
 
+
 async def download_audio(url: str) -> str | None:
     loop = asyncio.get_running_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
         return await loop.run_in_executor(pool, _download_audio_sync, url)
+
 
 # ==== HELPERS ====
 async def ensure_connected(ctx):
@@ -182,7 +198,7 @@ async def skip(ctx):
         await ctx.send("Nothing to skip.")
 
 @bot.command(name="queue")
-async def _queue(ctx):
+async def queue(ctx):
     if song_queue.empty():
         await ctx.send("The queue is empty!")
     else:
