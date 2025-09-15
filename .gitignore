@@ -1,0 +1,10 @@
+@"
+.env
+.env.*
+*.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+.vscode/
+.idea/
+"@" | Set-Content .gitignore -Encoding ascii
