@@ -1,110 +1,104 @@
+import os
+import asyncio
+import concurrent.futures
+
 import discord
 from discord.ext import commands
 import yt_dlp
-import asyncio
-import concurrent.futures
-import os
 from dotenv import load_dotenv
 
-# load environment variables from .env file (local dev only)
-load_dotenv()
+# ==== ENV ====
+load_dotenv()  # local only; Railway will inject env vars
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Define the bot and its command prefix
+# ==== DISCORD ====
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Define a queue for songs
+# ==== FS SETUP ====
+DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ==== QUEUE ====
 song_queue = asyncio.Queue()
 
-# Function to download audio from YouTube
-def download_audio(url):
+# ==== YT-DLP ====
+def _download_audio_sync(url: str) -> str | None:
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'm4a',
-            'preferredquality': '192',
-        }],
-        'ffmpeg_location': '/usr/bin/ffmpeg',
-        'ffprobe_location': '/usr/bin/ffprobe',
-        'postprocessor_args': ['-hide_banner'],
-        'quiet': True,
-        'outtmpl': '/home/scoutregiment830/bot_env/downloads/%(title)s.m4a',
-        'default_search': 'ytsearch',
-        'source_address': '0.0.0.0',
-        'nocheckcertificate': True
+        "format": "bestaudio/best",
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "192"}
+        ],
+        # Railway/Docker image ffmpeg path:
+        "ffmpeg_location": "/usr/bin/ffmpeg",
+        "ffprobe_location": "/usr/bin/ffprobe",
+        "postprocessor_args": ["-hide_banner"],
+        "quiet": True,
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
+        "default_search": "ytsearch",
+        "nocheckcertificate": True,
     }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             return ydl.prepare_filename(info)
-        except Exception as e:
-            print(f"Error downloading audio: {e}")
-            return None
+    except Exception as e:
+        print(f"[yt-dlp] error: {e}")
+        return None
 
-async def async_download_audio(url):
-    loop = asyncio.get_event_loop()
+async def download_audio(url: str) -> str | None:
+    loop = asyncio.get_running_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
-        return await loop.run_in_executor(pool, download_audio, url)
-    
-# Function to add songs to the queue
-async def add_to_queue(ctx, url):
-    # Replace YouTube Music links with standard YouTube links
-    if url.startswith("https://music.youtube.com"):
-        url = url.replace("https://music.youtube.com", "https://www.youtube.com")
-        await ctx.send("Detected YouTube Music link, converting to YouTube link...")
+        return await loop.run_in_executor(pool, _download_audio_sync, url)
 
-    audio_file = download_audio(url)
-    await song_queue.put(audio_file)
-    await ctx.send(f"Added to queue: {url}")
-
-    # Check if the bot is connected to a voice channel first
+# ==== HELPERS ====
+async def ensure_connected(ctx):
     if ctx.voice_client is None:
-        if ctx.author.voice:  # Check if the user is in a voice channel
+        if ctx.author.voice and ctx.author.voice.channel:
             await ctx.author.voice.channel.connect()
+            await ctx.send("Joined the voice channel!")
         else:
             await ctx.send("You need to be in a voice channel first!")
-            return
+            return False
+    return True
 
-    # Check if a song is already playing
-    if not ctx.voice_client.is_playing():
-        await play_next_song(ctx)
-
-
-
-
-# Function to play the next song in the queue
 async def play_next_song(ctx):
-    if not song_queue.empty():
-        audio_file = await song_queue.get()
-        print(f"Playing: {audio_file}")
-
-        source = discord.FFmpegPCMAudio(
-            executable="/usr/bin/ffmpeg",
-            source=audio_file,
-            before_options="-nostdin",
-            options="-vn"
-        )
-
-        ctx.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next_song(ctx), bot.loop))
-    else:
+    if song_queue.empty():
         await ctx.send("Queue is empty.")
+        return
 
+    audio_file = await song_queue.get()
+    if audio_file is None or not os.path.exists(audio_file):
+        await ctx.send("Failed to load the audio file. Skipping…")
+        return await play_next_song(ctx)
 
+    def _after_playback(err):
+        if err:
+            print(f"[playback] error: {err}")
+        # schedule next track from the event loop
+        fut = asyncio.run_coroutine_threadsafe(play_next_song(ctx), bot.loop)
+        try:
+            fut.result()
+        except Exception as e:
+            print(f"[after] error: {e}")
 
-# Command to join a voice channel
+    source = discord.FFmpegPCMAudio(
+        executable="/usr/bin/ffmpeg",
+        source=audio_file,
+        before_options="-nostdin",
+        options="-vn"
+    )
+    ctx.voice_client.play(source, after=_after_playback)
+
+# ==== COMMANDS ====
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ready)")
+
 @bot.command()
 async def join(ctx):
-    if ctx.author.voice:
-        channel = ctx.author.voice.channel
-        await channel.connect()
-        await ctx.send("Joined the voice channel!")
-    else:
-        await ctx.send("You need to join a voice channel first!")
+    await ensure_connected(ctx)
 
-# Command to leave a voice channel
 @bot.command()
 async def leave(ctx):
     if ctx.voice_client:
@@ -113,79 +107,90 @@ async def leave(ctx):
     else:
         await ctx.send("I'm not in a voice channel!")
 
-# Command to play a song or playlist
 @bot.command()
-async def play(ctx, url):
-    # Check if it's a playlist
-    if 'playlist' in url:
-        await ctx.send("Detected a playlist, fetching songs...")
-        ydl_opts = {'quiet': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            for entry in info['entries']:
-                song_url = entry['webpage_url']
-                await add_to_queue(ctx, song_url)
-    else:
-        # If it's a single song
-        await add_to_queue(ctx, url)
+async def play(ctx, *, url: str):
+    if url.startswith("https://music.youtube.com"):
+        url = url.replace("https://music.youtube.com", "https://www.youtube.com")
+        await ctx.send("Detected YouTube Music link, converting to YouTube…")
 
-# Command to pause the song
+    if not await ensure_connected(ctx):
+        return
+
+    # playlist detection
+    if "playlist" in url:
+        await ctx.send("Detected a playlist, fetching songs…")
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                entries = info.get("entries") or []
+                for entry in entries:
+                    song_url = entry.get("webpage_url")
+                    if song_url:
+                        audio_file = await download_audio(song_url)
+                        await song_queue.put(audio_file)
+                await ctx.send(f"Queued {len(entries)} tracks.")
+        except Exception as e:
+            await ctx.send(f"Failed to parse playlist: {e}")
+            return
+    else:
+        audio_file = await download_audio(url)
+        await song_queue.put(audio_file)
+        await ctx.send(f"Added to queue: {url}")
+
+    if not ctx.voice_client.is_playing():
+        await play_next_song(ctx)
+
 @bot.command()
 async def pause(ctx):
-    if ctx.voice_client.is_playing():
+    if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
-        await ctx.send("Paused the song!")
+        await ctx.send("Paused.")
     else:
-        await ctx.send("No song is currently playing.")
+        await ctx.send("Nothing is playing.")
 
-# Command to resume the song
 @bot.command()
 async def resume(ctx):
-    if ctx.voice_client.is_paused():
+    if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
-        await ctx.send("Resumed the song!")
+        await ctx.send("Resumed.")
     else:
-        await ctx.send("No song is currently paused.")
+        await ctx.send("Nothing is paused.")
 
-# Command to stop the song
 @bot.command()
 async def stop(ctx):
-    if ctx.voice_client.is_playing():
+    if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
-        await ctx.send("Stopped the song!")
+        await ctx.send("Stopped.")
     else:
-        await ctx.send("No song is currently playing.")
+        await ctx.send("Nothing is playing.")
 
-# Command to skip the current song
 @bot.command()
 async def skip(ctx):
-    if ctx.voice_client.is_playing():
+    if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
-        await ctx.send("Skipped the song!")
+        await ctx.send("Skipped.")
     else:
-        await ctx.send("No song to skip!")
+        await ctx.send("Nothing to skip.")
 
-# Command to view the queue
-@bot.command()
-async def queue(ctx):
+@bot.command(name="queue")
+async def _queue(ctx):
     if song_queue.empty():
         await ctx.send("The queue is empty!")
-        print("Queue is empty.")
     else:
         queue_list = list(song_queue._queue)
-        print(f"Current queue: {queue_list}")
-        message = "🎶 **Current Queue:**\n"
-        for idx, song in enumerate(queue_list, 1):
-            message += f"{idx}. {song}\n"
+        message = "🎶 **Current Queue:**\n" + "\n".join(f"{i+1}. {os.path.basename(s) if s else 'Error'}" for i, s in enumerate(queue_list))
         await ctx.send(message)
 
-
-# Command to clear the queue
 @bot.command()
 async def clear(ctx):
-    while not song_queue.empty():
-        await song_queue.get()
-    await ctx.send("Cleared the queue!")
+    try:
+        while not song_queue.empty():
+            await song_queue.get()
+        await ctx.send("Cleared the queue!")
+    except Exception:
+        await ctx.send("Queue already empty.")
 
-# Run the bot
+# ==== RUN ====
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is not set.")
 bot.run(TOKEN)
