@@ -1,24 +1,28 @@
-# Dockerfile
-FROM python:3.12-slim
+# Dockerfile (for Railway)
+FROM python:3.11-slim
 
-# System deps for voice
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    libopus0 \
-    && rm -rf /var/lib/apt/lists/*
-
-# (Optional) make logs flush immediately
-ENV PYTHONUNBUFFERED=1
-
+# Set a working dir
 WORKDIR /app
+
+# Copy only requirements first to leverage Docker layer caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Install system deps (ffmpeg + ca-certs) then install python deps.
+# Combine into one RUN to keep layers small.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ffmpeg \
+       ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    \
+    && python -m pip install --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt \
+    \
+    # Install yt-dlp from PyPI pre-releases (gets dev/nightly builds)
     && pip install --no-cache-dir --upgrade --pre "yt-dlp[default]"
- 
+
+# Copy the rest of the app
 COPY . .
 
-# Use a tmp path that's definitely writeable on Railway
-ENV DOWNLOAD_DIR=/tmp/downloads
-RUN mkdir -p $DOWNLOAD_DIR
-
-CMD ["python", "musicbot.py"]
+# Replace with how you run your app (example)
+CMD ["python", "app.py"]
