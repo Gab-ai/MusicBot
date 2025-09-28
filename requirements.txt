@@ -1,4 +1,4 @@
 discord.py
-yt-dlp @ git+https://github.com/yt-dlp/yt-dlp@nightly
+https://github.com/yt-dlp/yt-dlp/archive/refs/heads/nightly.zip
 python-dotenv
 PyNaCl
